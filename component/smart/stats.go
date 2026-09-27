@@ -1204,17 +1204,15 @@ func (s *Store) GetAllGroupsForConfig(config string) ([]string, error) {
 	}
 
 	if len(groupsMap) == 0 {
-		scanResults, err2 := s.DBViewPrefixScan(statsPath, -1, false)
+		// 原实现是 DBViewPrefixScan(statsPath, -1, ...) 全量扫描(记录数随使用时间增长);
+		// 这里只需要"有哪些 group",用子前缀列表即可:内存 O(group 数),不读任何记录体。
+		subPrefixes, err2 := s.DBListSubPrefixes(statsPath, 1, true)
 		if err2 != nil {
 			return nil, err2
 		}
-		for path := range scanResults {
-			parts := strings.Split(path, "/")
-			if len(parts) >= 4 {
-				group := parts[3]
-				if group != "" {
-					groupsMap[group] = true
-				}
+		for _, sub := range subPrefixes {
+			if group := sub[strings.LastIndexByte(sub, '/')+1:]; group != "" {
+				groupsMap[group] = true
 			}
 		}
 	}
@@ -1647,31 +1645,43 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 
 	var firstErr error
 
-	// 清理 stats
+	// 清理 stats(stats 的 key = .../<target>/<node>,node 在末段,没法按 node 前缀直查)
+	// 原实现把整组 stats 记录一次性读进内存;改成按 target 子前缀分批读,峰值内存 O(单个 target)。
 	statsPrefix := FormatDBKey(KeyTypeStats, config, group)
-	statsResults, err := s.DBViewPrefixScan(statsPrefix, -1, false)
+	statsTargets, err := s.DBListSubPrefixes(statsPrefix, 1, true)
 	if err != nil {
 		return err
 	}
-	var statsToDelete []string
-	for path := range statsResults {
-		if strings.Count(path, "/") < 5 {
+	for _, targetPrefix := range statsTargets {
+		targetRecords, scanErr := s.DBViewPrefixScan(targetPrefix, -1, false)
+		if scanErr != nil {
+			if firstErr == nil {
+				firstErr = scanErr
+			}
 			continue
 		}
-		node := path[strings.LastIndexByte(path, '/')+1:]
-		if _, ok := nodeSet[node]; ok {
-			statsToDelete = append(statsToDelete, path)
+		var statsToDelete []string
+		for path := range targetRecords {
+			if strings.Count(path, "/") < 5 {
+				continue
+			}
+			node := path[strings.LastIndexByte(path, '/')+1:]
+			if _, ok := nodeSet[node]; ok {
+				statsToDelete = append(statsToDelete, path)
+			}
 		}
-	}
-	if len(statsToDelete) > 0 {
-		if delErr := s.DBBatchDeletePrefix(statsToDelete, true); delErr != nil && firstErr == nil {
-			firstErr = delErr
+		if len(statsToDelete) > 0 {
+			if delErr := s.DBBatchDeletePrefix(statsToDelete, true); delErr != nil && firstErr == nil {
+				firstErr = delErr
+			}
 		}
 	}
 
 	// 清理 prefetch
 	prefetchPrefix := FormatDBKey(KeyTypePrefetch, config, group)
-	prefetchResults, err := s.DBViewPrefixScan(prefetchPrefix, -1, false)
+	// key = .../<target>,每个 target 只有一条记录:枚举子前缀后逐条点读,
+	// 不再把整组记录读进内存(原为 DBViewPrefixScan(prefetchPrefix, -1, ...))。
+	prefetchTargets, err := s.DBListSubPrefixes(prefetchPrefix, 1, true)
 	if err != nil {
 		if firstErr == nil {
 			firstErr = err
@@ -1679,7 +1689,18 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 		return firstErr
 	}
 	var prefetchToDelete []string
-	for path, data := range prefetchResults {
+	for _, path := range prefetchTargets {
+		data, getErr := s.DBViewGetItem(path)
+		if getErr != nil {
+			if firstErr == nil {
+				firstErr = getErr
+			}
+			continue
+		}
+		if len(data) == 0 {
+			prefetchToDelete = append(prefetchToDelete, path)
+			continue
+		}
 		var pm PrefetchMap
 		if err := json.Unmarshal(data, &pm); err != nil {
 			prefetchToDelete = append(prefetchToDelete, path)
@@ -1742,12 +1763,15 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 
 	// 清理 ranking
 	rankingPrefix := FormatDBKey(KeyTypeRanking, config, group)
-	rankingResults, err := s.DBViewPrefixScan(rankingPrefix, -1, true)
-	if err != nil {
+	// key = .../<group>,整组只有一条记录 → 直接点读,不再做前缀扫描。
+	rankingResults := make(map[string][]byte, 1)
+	if rankingData, getErr := s.DBViewGetItem(rankingPrefix); getErr != nil {
 		if firstErr == nil {
-			firstErr = err
+			firstErr = getErr
 		}
 		return firstErr
+	} else if len(rankingData) > 0 {
+		rankingResults[rankingPrefix] = rankingData
 	}
 	var rankingToDelete []string
 	for path, data := range rankingResults {
@@ -1793,13 +1817,25 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 
 	var failuresToDelete []string
 	failuresPrefix := FormatDBKey(KeyTypeHostFailures, config, group)
-	failuresResults, err := s.DBViewPrefixScan(failuresPrefix, -1, false)
-	if err != nil {
+	// key = .../<target>,每个 target 一条记录:枚举子前缀后逐条点读,不再整组全量读。
+	failuresTargets, listErr := s.DBListSubPrefixes(failuresPrefix, 1, true)
+	if listErr != nil {
 		if firstErr == nil {
-			firstErr = err
+			firstErr = listErr
 		}
 	} else {
-		for path, data := range failuresResults {
+		for _, path := range failuresTargets {
+			data, getErr := s.DBViewGetItem(path)
+			if getErr != nil {
+				if firstErr == nil {
+					firstErr = getErr
+				}
+				continue
+			}
+			if len(data) == 0 {
+				failuresToDelete = append(failuresToDelete, path)
+				continue
+			}
 			var hs HostStatus
 			if err := json.Unmarshal(data, &hs); err != nil {
 				failuresToDelete = append(failuresToDelete, path)
@@ -1890,34 +1926,8 @@ func (s *Store) CleanupOldRecords(group, config string) {
 	maxTargets := globalCacheParams.MaxTargets
 	globalCacheParams.mutex.RUnlock()
 
-	// 每次扫描的读取上限。原实现传 -1(无上限),把整组记录一次性读进内存再排序:
-	// 记录数随使用时间增长,这批周期性扫描(每组每 10 分钟 × 3 类 × 5 组)会越来越重,
-	// 在 256MiB 软上限下直接把堆顶推高、加剧 GC 抖动。
-	// 取 2*maxTargets+1 是为了保留"记录数超过上限才按数量删"的判定语义;
-	// DBViewPrefixScan 在带 limit 时用蓄水池抽样返回,因此每轮清理的是随机子集,
-	// 多轮累积后同样收敛,而单轮内存占用被压到常数级。
-	const minCleanupScanLimit = 2000
-	const maxCleanupScanLimit = 12000
-	scanLimit := maxTargets*2 + 1
-	if scanLimit < minCleanupScanLimit {
-		scanLimit = minCleanupScanLimit
-	}
-	if scanLimit > maxCleanupScanLimit {
-		scanLimit = maxCleanupScanLimit
-	}
-
 	for _, keyType := range keyTypes {
 		pathPrefix := FormatDBKey(keyType, config, group)
-
-		rawData, err := s.DBViewPrefixScan(pathPrefix, scanLimit, false)
-		if err != nil {
-			continue
-		}
-
-		if len(rawData) >= scanLimit {
-			log.Debugln("[SmartStore] Cleanup scan for [%s] group [%s] hit the %d-record limit (reservoir sample); the rest is handled in later rounds",
-				keyType, group, scanLimit)
-		}
 
 		type targetInfo struct {
 			time   time.Time
@@ -1927,60 +1937,74 @@ func (s *Store) CleanupOldRecords(group, config string) {
 		targetMap := make(map[string]*targetInfo)
 		var toDelete []string
 
-		for path, data := range rawData {
-			parts := strings.Split(path, "/")
-			if len(parts) < 5 {
+		// 逐 target 子前缀分批读。原实现是 DBViewPrefixScan(pathPrefix, ...) 把整组记录
+		// (记录数随使用时间增长)一次性读进内存再排序 —— 这是"用久变卡"的主要内存来源。
+		// 现在每轮只读一个 target 的记录(数量级 = 该组节点数),峰值内存 O(单个 target),
+		// 而 targetMap 只保留 path/value/time 这些小结构,不持有记录体副本。
+		targetPrefixes, listErr := s.DBListSubPrefixes(pathPrefix, 1, true)
+		if listErr != nil {
+			continue
+		}
+		for _, targetPrefix := range targetPrefixes {
+			rawData, scanErr := s.DBViewPrefixScan(targetPrefix, -1, false)
+			if scanErr != nil {
 				continue
 			}
-			target := parts[4]
+			for path, data := range rawData {
+				parts := strings.Split(path, "/")
+				if len(parts) < 5 {
+					continue
+				}
+				target := parts[4]
 
-			// 优先保留使用频率高和最近使用的记录
-			var lastTime int64
-			var value float64
-			switch keyType {
-			case KeyTypeStats:
-				if len(parts) < 6 {
-					continue
-				}
-				var record StatsRecord
-				if err := json.Unmarshal(data, &record); err != nil {
-					toDelete = append(toDelete, path)
-					continue
-				}
-				lastTime = record.LastUsed
-				value = float64(record.Success + record.Failure)
-			case KeyTypePrefetch:
-				var pm PrefetchMap
-				if err := json.Unmarshal(data, &pm); err != nil {
-					toDelete = append(toDelete, path)
-					continue
-				}
-				lastTime = pm.UpdatedTime
-				value = float64(len(pm.TCP.Nodes) + len(pm.UDP.Nodes))
-			case KeyTypeHostFailures:
-				var stats HostStatus
-				if err := json.Unmarshal(data, &stats); err != nil {
-					toDelete = append(toDelete, path)
-					continue
-				}
-				if stats.LastFailure > lastTime {
-					lastTime = stats.LastFailure
-				}
-				totalNodes := 0
-				for _, codeSet := range stats.Codes {
-					if codeSet != nil {
-						totalNodes += len(codeSet.Nodes)
+				// 优先保留使用频率高和最近使用的记录
+				var lastTime int64
+				var value float64
+				switch keyType {
+				case KeyTypeStats:
+					if len(parts) < 6 {
+						continue
 					}
+					var record StatsRecord
+					if err := json.Unmarshal(data, &record); err != nil {
+						toDelete = append(toDelete, path)
+						continue
+					}
+					lastTime = record.LastUsed
+					value = float64(record.Success + record.Failure)
+				case KeyTypePrefetch:
+					var pm PrefetchMap
+					if err := json.Unmarshal(data, &pm); err != nil {
+						toDelete = append(toDelete, path)
+						continue
+					}
+					lastTime = pm.UpdatedTime
+					value = float64(len(pm.TCP.Nodes) + len(pm.UDP.Nodes))
+				case KeyTypeHostFailures:
+					var stats HostStatus
+					if err := json.Unmarshal(data, &stats); err != nil {
+						toDelete = append(toDelete, path)
+						continue
+					}
+					if stats.LastFailure > lastTime {
+						lastTime = stats.LastFailure
+					}
+					totalNodes := 0
+					for _, codeSet := range stats.Codes {
+						if codeSet != nil {
+							totalNodes += len(codeSet.Nodes)
+						}
+					}
+					value = float64(totalNodes)
+				default:
+					continue
 				}
-				value = float64(totalNodes)
-			default:
-				continue
-			}
 
-			targetMap[path] = &targetInfo{
-				time:   time.Unix(lastTime, 0),
-				value:  value,
-				target: target,
+				targetMap[path] = &targetInfo{
+					time:   time.Unix(lastTime, 0),
+					value:  value,
+					target: target,
+				}
 			}
 		}
 

@@ -483,6 +483,64 @@ func (s *Store) DBViewPrefixScan(prefix string, maxResults int, strict bool) (ma
 	return result, nil
 }
 
+// 列出 prefix 下第 depth 层的所有子前缀(升序、去重)。
+// 用途:把原本"整组前缀全量读进内存"的周期扫描,改造成"逐个 target 子前缀分批读",
+// 峰值内存从 O(全部记录) 降到 O(单个子前缀的记录数)。底层走 bbolt 有序游标,不需要额外索引。
+// strict=true 时要求紧邻 prefix 的字符是 '/' 或 key 恰好以 prefix 结尾(避免 jp1 匹配到 jp10)。
+func (s *Store) DBListSubPrefixes(prefix string, depth int, strict bool) ([]string, error) {
+	if db == nil {
+		return nil, errors.New("DB Cache file load failed")
+	}
+	if depth <= 0 || prefix == "" {
+		return nil, nil
+	}
+
+	var result []string
+	prefixBytes := []byte(prefix)
+
+	err := db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(bucketSmartStats)
+		if bucket == nil {
+			return nil
+		}
+		cursor := bucket.Cursor()
+		last := ""
+		for k, _ := cursor.Seek(prefixBytes); k != nil && bytes.HasPrefix(k, prefixBytes); k, _ = cursor.Next() {
+			if strict && len(k) > len(prefixBytes) && k[len(prefixBytes)] != '/' {
+				continue
+			}
+			rest := k[len(prefixBytes):]
+			rest = bytes.TrimPrefix(rest, []byte("/"))
+			if len(rest) == 0 {
+				continue
+			}
+			// 截到第 depth 层:定位第 depth 个分隔符
+			end := len(rest)
+			segCount := 0
+			for i := 0; i < len(rest); i++ {
+				if rest[i] == '/' {
+					segCount++
+					if segCount == depth {
+						end = i
+						break
+					}
+				}
+			}
+			seg := string(rest[:end])
+			if seg == "" || seg == last {
+				continue
+			}
+			last = seg
+			result = append(result, prefix+"/"+seg)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // 删除前缀匹配的所有记录
 func (s *Store) DBBatchDeletePrefix(prefixes []string, strict bool) error {
 	if db == nil {
