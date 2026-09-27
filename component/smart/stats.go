@@ -1890,12 +1890,33 @@ func (s *Store) CleanupOldRecords(group, config string) {
 	maxTargets := globalCacheParams.MaxTargets
 	globalCacheParams.mutex.RUnlock()
 
+	// 每次扫描的读取上限。原实现传 -1(无上限),把整组记录一次性读进内存再排序:
+	// 记录数随使用时间增长,这批周期性扫描(每组每 10 分钟 × 3 类 × 5 组)会越来越重,
+	// 在 256MiB 软上限下直接把堆顶推高、加剧 GC 抖动。
+	// 取 2*maxTargets+1 是为了保留"记录数超过上限才按数量删"的判定语义;
+	// DBViewPrefixScan 在带 limit 时用蓄水池抽样返回,因此每轮清理的是随机子集,
+	// 多轮累积后同样收敛,而单轮内存占用被压到常数级。
+	const minCleanupScanLimit = 2000
+	const maxCleanupScanLimit = 12000
+	scanLimit := maxTargets*2 + 1
+	if scanLimit < minCleanupScanLimit {
+		scanLimit = minCleanupScanLimit
+	}
+	if scanLimit > maxCleanupScanLimit {
+		scanLimit = maxCleanupScanLimit
+	}
+
 	for _, keyType := range keyTypes {
 		pathPrefix := FormatDBKey(keyType, config, group)
 
-		rawData, err := s.DBViewPrefixScan(pathPrefix, -1, false)
+		rawData, err := s.DBViewPrefixScan(pathPrefix, scanLimit, false)
 		if err != nil {
 			continue
+		}
+
+		if len(rawData) >= scanLimit {
+			log.Debugln("[SmartStore] Cleanup scan for [%s] group [%s] hit the %d-record limit (reservoir sample); the rest is handled in later rounds",
+				keyType, group, scanLimit)
 		}
 
 		type targetInfo struct {
