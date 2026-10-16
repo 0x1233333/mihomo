@@ -1,10 +1,31 @@
 package outboundgroup
 
 import (
+	C "github.com/metacubex/mihomo/constant"
+	N "github.com/metacubex/mihomo/common/net"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dlclark/regexp2"
+	"github.com/metacubex/mihomo/common/atomic"
+	"github.com/metacubex/mihomo/common/callback"
+	"github.com/metacubex/mihomo/common/singleflight"
+	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/common/xsync"
+	"github.com/metacubex/mihomo/component/geodata"
+	"github.com/metacubex/mihomo/component/mmdb"
+	"github.com/metacubex/mihomo/component/profile/cachefile"
+	"github.com/metacubex/mihomo/component/resolver"
+	"github.com/metacubex/mihomo/component/smart"
+	"github.com/metacubex/mihomo/component/smart/lightgbm"
+	"github.com/metacubex/mihomo/component/smart/tcpstats"
+	"github.com/metacubex/mihomo/constant/provider"
+	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/tunnel"
+	"github.com/metacubex/mihomo/tunnel/statistic"
+	"github.com/samber/lo"
+	"golang.org/x/exp/slices"
 	"io"
 	"math"
 	"math/rand"
@@ -17,27 +38,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/dlclark/regexp2"
-	"github.com/metacubex/mihomo/common/atomic"
-	"github.com/metacubex/mihomo/common/callback"
-	N "github.com/metacubex/mihomo/common/net"
-	"github.com/metacubex/mihomo/common/singleflight"
-	"github.com/metacubex/mihomo/common/xsync"
-	"github.com/metacubex/mihomo/component/geodata"
-	"github.com/metacubex/mihomo/component/mmdb"
-	"github.com/metacubex/mihomo/component/profile/cachefile"
-	"github.com/metacubex/mihomo/component/resolver"
-	"github.com/metacubex/mihomo/component/smart"
-	"github.com/metacubex/mihomo/component/smart/lightgbm"
-	"github.com/metacubex/mihomo/component/smart/tcpstats"
-	C "github.com/metacubex/mihomo/constant"
-	"github.com/metacubex/mihomo/constant/provider"
-	"github.com/metacubex/mihomo/log"
-	"github.com/metacubex/mihomo/tunnel"
-	"github.com/metacubex/mihomo/tunnel/statistic"
-	"github.com/samber/lo"
-	"golang.org/x/exp/slices"
 )
 
 const (
@@ -184,6 +184,17 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 	s.InitSmart()
 
 	return s, nil
+}
+
+// 成员测速必须记在「组自己配置的 testUrl」名下。
+// 若沿用调用方传入的 url(App 的整组测速历史上固定使用 gstatic),
+// 组内按 testUrl 读取的 LastDelayForTestUrl / DelayHistoryForTestUrl 会永远为空,
+// 造成基于延迟的自动屏蔽与兜底排序整体失效。这里强制改用 s.testUrl。
+func (s *Smart) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error) {
+	if s.testUrl != "" {
+		url = s.testUrl
+	}
+	return s.GroupBase.URLTest(ctx, url, expectedStatus)
 }
 
 func (s *Smart) GetConfigFilename() string {
