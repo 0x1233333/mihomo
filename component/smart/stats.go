@@ -453,7 +453,6 @@ func (s *Store) GetNodeWeightRanking(group, config, testUrl string, proxies []C.
 		return NodeRank{}, fmt.Errorf("no proxies provided")
 	}
 
-	resultItems := make([]NodeRankItem, 0, len(proxies))
 	proxyNames := make([]string, 0, len(proxies))
 	allNodes := make(map[string]struct{}, len(proxies))
 	aliveNodes := make(map[string]bool, len(proxies))
@@ -497,76 +496,108 @@ func (s *Store) GetNodeWeightRanking(group, config, testUrl string, proxies []C.
 		}
 	}
 
+	resultItems := finalizeRankItems(proxyNames, nodeScores, aliveNodes)
+	if len(resultItems) == 0 {
+		return NodeRank{}, nil
+	}
+
+	wrapper := NodeRank{LastUpdated: time.Now().Unix(), Result: resultItems}
+	s.StoreNodeWeightRanking(group, config, wrapper)
+	return wrapper, nil
+}
+
+// finalizeRankItems 把预取得分整理成排名条目。
+// 探测失败(或被拉黑)的节点不参与权重归一化: 它们仍出现在结果里但权重记 0,
+// 避免出现"权重 100 但探测失败"这种自相矛盾的排名。若整组都探测失败, 退回旧口径,
+// 以免网络切换的瞬间排名被清空。
+func finalizeRankItems(proxyNames []string, nodeScores map[string]float64, aliveNodes map[string]bool) []NodeRankItem {
+	usableScores := nodeScores
+	hasAliveScored := false
+	for node, score := range nodeScores {
+		if score > 0 && aliveNodes[node] {
+			hasAliveScored = true
+			break
+		}
+	}
+	if hasAliveScored {
+		usableScores = make(map[string]float64, len(nodeScores))
+		skipped := 0
+		for node, score := range nodeScores {
+			if aliveNodes[node] {
+				usableScores[node] = score
+			} else {
+				skipped++
+			}
+		}
+		if skipped > 0 {
+			log.Debugln("[Smart] Weight ranking: %d dead node(s) excluded from normalization", skipped)
+		}
+	}
+
 	maxScore := 0.0
-	for _, score := range nodeScores {
+	for _, score := range usableScores {
 		if score > maxScore {
 			maxScore = score
 		}
 	}
-
 	if maxScore == 0 {
-		return NodeRank{}, nil
+		return nil
 	}
 
+	items := make([]NodeRankItem, 0, len(proxyNames))
 	for _, node := range proxyNames {
-		score := nodeScores[node]
+		score := usableScores[node]
 		percentScore := math.Round(score/maxScore*100*100) / 100
-		resultItems = append(resultItems, NodeRankItem{Name: node, Weight: percentScore, Rank: ""})
+		items = append(items, NodeRankItem{Name: node, Weight: percentScore, Rank: ""})
 	}
 
-	sort.Slice(resultItems, func(i, j int) bool {
-		ai := aliveNodes[resultItems[i].Name]
-		aj := aliveNodes[resultItems[j].Name]
+	sort.Slice(items, func(i, j int) bool {
+		ai := aliveNodes[items[i].Name]
+		aj := aliveNodes[items[j].Name]
 		if ai != aj {
 			return ai
 		}
-		if resultItems[i].Weight != resultItems[j].Weight {
-			return resultItems[i].Weight > resultItems[j].Weight
+		if items[i].Weight != items[j].Weight {
+			return items[i].Weight > items[j].Weight
 		}
-		return resultItems[i].Name < resultItems[j].Name
+		return items[i].Name < items[j].Name
 	})
 
-	if len(resultItems) > 0 {
-		aliveCount := 0
-		positiveAliveCount := 0
-		for _, r := range resultItems {
-			if aliveNodes[r.Name] {
-				aliveCount++
-				if r.Weight > 0 {
-					positiveAliveCount++
-				}
+	aliveCount := 0
+	positiveAliveCount := 0
+	for _, r := range items {
+		if aliveNodes[r.Name] {
+			aliveCount++
+			if r.Weight > 0 {
+				positiveAliveCount++
 			}
 		}
-
-		if aliveCount > 0 && positiveAliveCount > 0 {
-			mostUsedBound := int(float64(positiveAliveCount) * 0.2)
-			if mostUsedBound < 1 {
-				mostUsedBound = 1
-			}
-
-			occasionalBound := mostUsedBound + int(float64(positiveAliveCount)*0.5)
-
-			for i := 0; i < mostUsedBound; i++ {
-				resultItems[i].Rank = RankMostUsed
-			}
-			for i := mostUsedBound; i < occasionalBound; i++ {
-				resultItems[i].Rank = RankOccasional
-			}
-			for i := occasionalBound; i < aliveCount; i++ {
-				resultItems[i].Rank = RankRarelyUsed
-			}
-		}
-
-		for i := aliveCount; i < len(resultItems); i++ {
-			resultItems[i].Rank = RankRarelyUsed
-		}
-
-		wrapper := NodeRank{LastUpdated: time.Now().Unix(), Result: resultItems}
-		s.StoreNodeWeightRanking(group, config, wrapper)
-		return wrapper, nil
 	}
 
-	return NodeRank{}, nil
+	if aliveCount > 0 && positiveAliveCount > 0 {
+		mostUsedBound := int(float64(positiveAliveCount) * 0.2)
+		if mostUsedBound < 1 {
+			mostUsedBound = 1
+		}
+
+		occasionalBound := mostUsedBound + int(float64(positiveAliveCount)*0.5)
+
+		for i := 0; i < mostUsedBound; i++ {
+			items[i].Rank = RankMostUsed
+		}
+		for i := mostUsedBound; i < occasionalBound; i++ {
+			items[i].Rank = RankOccasional
+		}
+		for i := occasionalBound; i < aliveCount; i++ {
+			items[i].Rank = RankRarelyUsed
+		}
+	}
+
+	for i := aliveCount; i < len(items); i++ {
+		items[i].Rank = RankRarelyUsed
+	}
+
+	return items
 }
 
 // 存储节点权重排名
