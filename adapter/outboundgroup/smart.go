@@ -1,8 +1,6 @@
 package outboundgroup
 
 import (
-	C "github.com/metacubex/mihomo/constant"
-	N "github.com/metacubex/mihomo/common/net"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +8,7 @@ import (
 	"github.com/dlclark/regexp2"
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/callback"
+	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/singleflight"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/common/xsync"
@@ -20,6 +19,7 @@ import (
 	"github.com/metacubex/mihomo/component/smart"
 	"github.com/metacubex/mihomo/component/smart/lightgbm"
 	"github.com/metacubex/mihomo/component/smart/tcpstats"
+	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel"
@@ -39,6 +39,10 @@ import (
 	"sync"
 	"time"
 )
+
+// smartAutoName 是"未手动锁定"时 Now() 返回的虚拟成员名。
+// 它同时是 UI/API 用来"回到自动"的标记。
+const smartAutoName = "Smart - Select"
 
 const (
 	cleanupInterval          = 120 * time.Minute
@@ -529,6 +533,15 @@ func (s *Smart) WrapPacketConnWithMetric(pc C.PacketConn, proxy C.Proxy, metadat
 }
 
 func (s *Smart) Set(name string) error {
+	// 空名 / 自动标记 = 解除手动锁定,回到自动选路。
+	// Now() 在没有手动锁定时返回 "Smart - Select",所以 UI/API 要能把它设回来,
+	// 否则用户手点一个节点后再也无法回到自动(实测 PUT "Smart - Select" 返回
+	// 400 "Selector update error: proxy not exist")。
+	if name == "" || name == smartAutoName {
+		s.selected = ""
+		return nil
+	}
+
 	var p C.Proxy
 	for _, proxy := range s.GetProxies(false) {
 		if proxy.Name() == name {
@@ -560,7 +573,7 @@ func (s *Smart) Now() string {
 		s.selected = ""
 	}
 
-	return "Smart - Select"
+	return smartAutoName
 }
 
 func (s *Smart) MarshalJSON() ([]byte, error) {
