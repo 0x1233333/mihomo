@@ -618,6 +618,58 @@ func (s *Smart) Proxies() []C.Proxy {
 	return s.GetProxies(false)
 }
 
+// smartDelayFactor 把组健康检查延迟换算成 [0.35, 1] 的乘子。
+//
+// 800ms 的时间常数让 30ms≈0.96、300ms≈0.69、1000ms≈0.29(夹到 0.35)、再慢也是 0.35 ——
+// 下限存在的理由: 延迟高不等于吞吐差(实测两者负相关), 只该让它在排序里退一档,
+// 不该像 weight.go 那样在 2000ms 之后彻底失去区分度。
+func smartDelayFactor(delayMs uint16) float64 {
+	f := math.Exp(-float64(delayMs) / 800)
+	if f < 0.35 {
+		return 0.35
+	}
+	return f
+}
+
+// smartCandidateEff 是 filterProxies 的排序键: 有效分 eff + 该名字在 names 里的原下标。
+type candidateEff struct {
+	proxy C.Proxy
+	eff   float64
+	index int
+}
+
+// sortCandidatesByEff 按 eff 降序排, 带 5% 死区: 与第一名相差不到 5% 的候选一律按
+// names 原序, 否则两个几乎并列的节点会随测速抖动每次连接换一次, 首包时间忽高忽低。
+//
+// 实现上先算死区下界再排序, 而不是在比较函数里算相对差: 相对差比较不满足传递性,
+// 会给出自相矛盾的顺序(Go 的 sort 不会报错, 只是结果怪)。
+// maxEff==0 时(既无权重又无测速)整组都进死区 ⇒ 保持原顺序, 不会因为"No data"乱跳。
+func sortCandidatesByEff(cands []candidateEff) {
+	if len(cands) < 2 {
+		return
+	}
+	maxEff := cands[0].eff
+	for _, c := range cands[1:] {
+		if c.eff > maxEff {
+			maxEff = c.eff
+		}
+	}
+	tie := maxEff * 0.95 // 与第一名差距 ≤5% 视为打平
+	sort.SliceStable(cands, func(i, j int) bool {
+		ti, tj := cands[i].eff >= tie, cands[j].eff >= tie
+		if ti != tj {
+			return ti // 死区内的整体排前面
+		}
+		if ti {
+			return cands[i].index < cands[j].index // 打平 ⇒ 保持原顺序, 第一名不抖
+		}
+		if cands[i].eff != cands[j].eff {
+			return cands[i].eff > cands[j].eff
+		}
+		return cands[i].index < cands[j].index
+	})
+}
+
 func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names []string, weights []float64, all []C.Proxy, minCount int, isUDP bool) []C.Proxy {
 	blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
 	wtFailNodes, _, _, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, int(s.hostFailLimit.Load()), metadata.SmartTarget)
@@ -634,6 +686,14 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 
 	selected := make([]C.Proxy, 0, minCount+1)
 
+	// 候选的"有效分" eff = 权重 × 延迟因子。
+	// 原实现只按权重降序: 而 weight.go:144-148 把延迟分夹在 [0.3,0.8](30ms=0.90、
+	// 2000ms=0.70、4000ms 仍是 0.70), AllowedWeight=0.4 要成功率跌到 ~50% 才破
+	// ⇒ 慢节点永不降级。实测 100 个节点里好节点很多, 某站点的历史却总落在先连上的
+	// 那个慢节点上。这里把延迟显式乘进排序键, 让"权重接近的两个节点"按当前
+	// 健康检查延迟分出先后。
+	candidates := make([]candidateEff, 0, minCount+1)
+
 	for i, name := range names {
 		checkNodeUsed[name] = true
 		proxy := proxyByName[name]
@@ -641,10 +701,16 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 			continue
 		}
 		w := 0.0
+		hasWeight := false
 		if weights != nil && i < len(weights) {
 			w = weights[i]
+			hasWeight = w > 0
 		}
-		if weights != nil && w < smart.AllowedWeight {
+		// AllowedWeight 只淘汰"确实有历史权重"的节点。
+		// 无记录节点权重恒为 0(stats.go 只遍历该 target 已有记录的节点,
+		// weight.go:100-103 在样本<2 时直接返回 0), 以前被同一行 `w < 0.4` 一起判死,
+		// 于是"没历史但很好"的节点永远进不了候选 —— 下面冷启动入场就是给它们一条路。
+		if hasWeight && w < smart.AllowedWeight {
 			continue
 		}
 		if wtFailNodes[name] != 0 {
@@ -652,12 +718,33 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 				continue
 			}
 		}
-		selected = append(selected, proxy)
+		delayMs := proxy.LastDelayForTestUrl(s.testUrl)
+		eff := 0.0
+		switch {
+		case hasWeight:
+			eff = w * smartDelayFactor(delayMs)
+		case delayMs > 0:
+			// 冷启动入场: 中性基准 0.5 乘延迟因子, 能参与竞争但压不过高权重的老节点。
+			eff = 0.5 * smartDelayFactor(delayMs)
+		}
+		// 权重与测速延迟都拿不到 ⇒ eff 保持 0: 排在最后, 但仍留在候选里当最后兜底。
+		candidates = append(candidates, candidateEff{proxy: proxy, eff: eff, index: i})
 	}
 
-	// Unwrap result should not filled
-	if weights == nil && len(selected) > 0 {
+	// Unwrap 结果(weights==nil)按缓存原序返回: 那条顺序是上一次实测的赢家顺序,
+	// 按 eff(此时只有延迟)重排会把"延迟最低"顶到第一位 —— 实测延迟与吞吐负相关。
+	if weights == nil && len(candidates) > 0 {
+		for _, c := range candidates {
+			selected = append(selected, c.proxy)
+		}
 		return selected
+	}
+
+	sortCandidatesByEff(candidates)
+
+	selected = selected[:0]
+	for _, c := range candidates {
+		selected = append(selected, c.proxy)
 	}
 
 	if len(selected) >= len(all) {
@@ -744,45 +831,76 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 
 	if len(selected) == 0 {
 		fallbackAll := defaultSort(slices.Clone(all))
-		for _, p := range fallbackAll {
-			if (wtFailNodes[p.Name()] == 0 || (wtBlocked && wtFailNodes[p.Name()] != 1)) && p.AliveForTestUrl(s.testUrl) && (!isUDP || p.SupportUDP()) {
-				selected = append(selected, p)
-			}
-			if len(selected) >= minCount {
-				break
-			}
-		}
 
-		if len(selected) == 0 {
+		// 兜底也必须尊重封禁名单: 以前这里直接无视 blockedNodes, 实测某节点正在
+		// 被封禁期内(logcat 只有 'block period expired, unblocking' 的解封日志),
+		// 4 条新连接照样打到它身上。只有在"排除封禁后一个都不剩"时才退回不排除的
+		// 老行为 —— 宁可打到被封节点, 也不能出现无节点可用。
+		fallback := func(skipBlocked bool) []C.Proxy {
+			picked := make([]C.Proxy, 0, minCount)
+			pass := func(name string) bool {
+				return !skipBlocked || !blockedNodes[name]
+			}
+			// 1) 不撞域名失败记录、活着、UDP 可用
 			for _, p := range fallbackAll {
-				if p.AliveForTestUrl(s.testUrl) {
-					selected = append(selected, p)
-				}
-				if len(selected) >= minCount {
+				if len(picked) >= minCount {
 					break
 				}
-			}
-		}
-
-		if len(selected) == 0 {
-			for _, p := range fallbackAll {
-				if wtFailNodes[p.Name()] == 1 {
+				if !pass(p.Name()) {
 					continue
 				}
-				selected = append(selected, p)
-				if len(selected) >= minCount {
-					break
+				if (wtFailNodes[p.Name()] == 0 || (wtBlocked && wtFailNodes[p.Name()] != 1)) && p.AliveForTestUrl(s.testUrl) && (!isUDP || p.SupportUDP()) {
+					picked = append(picked, p)
 				}
 			}
-
-			if len(selected) == 0 {
+			// 2) 只要求活着
+			if len(picked) == 0 {
 				for _, p := range fallbackAll {
-					selected = append(selected, p)
-					if len(selected) >= minCount {
+					if len(picked) >= minCount {
 						break
+					}
+					if !pass(p.Name()) {
+						continue
+					}
+					if p.AliveForTestUrl(s.testUrl) {
+						picked = append(picked, p)
 					}
 				}
 			}
+			// 3) 只排除硬失败
+			if len(picked) == 0 {
+				for _, p := range fallbackAll {
+					if len(picked) >= minCount {
+						break
+					}
+					if !pass(p.Name()) {
+						continue
+					}
+					if wtFailNodes[p.Name()] == 1 {
+						continue
+					}
+					picked = append(picked, p)
+				}
+			}
+			// 4) 什么条件都不看
+			if len(picked) == 0 {
+				for _, p := range fallbackAll {
+					if len(picked) >= minCount {
+						break
+					}
+					if !pass(p.Name()) {
+						continue
+					}
+					picked = append(picked, p)
+				}
+			}
+			return picked
+		}
+
+		selected = fallback(true)
+		if len(selected) == 0 {
+			log.Debugln("[Smart] Group [%s] all fallback candidates are blocked, ignoring block list to stay dialable", s.Name())
+			selected = fallback(false)
 		}
 	}
 
@@ -1319,6 +1437,17 @@ func (s *Smart) checkNodesStable() {
 
 		gradeWorsened := (prevGrade > 0 && newGrade > prevGrade) || (prevGrade <= 2 && newGrade > 2)
 		if currentAnomaly || unstable || gradeWorsened {
+			// 封禁以前是静默的: 只有 checkBlockedNodes 的解封有日志, "封了谁、封多久、
+			// 凭什么封" 在 logcat 里查不到 —— 排查"为什么打到了这个慢节点"时全凭猜。
+			reason := "grade-worsened"
+			switch {
+			case currentAnomaly:
+				reason = "anomaly"
+			case unstable:
+				reason = "unstable"
+			}
+			log.Debugln("[Smart] Node [%s] blocked for %v (grade=%d, reason=%s)",
+				proxyName, time.Duration(blockedUntil-now)*time.Second, newGrade, reason)
 			state.BlockedUntil = blockedUntil
 			blockCopy := state
 			nodesToBlock[proxyName] = &blockCopy
